@@ -175,11 +175,64 @@ def init_db():
 
     _add_column_if_missing(conn, "drivers", "trip_id INTEGER", "trip_id")
 
-    # matches already includes new cols above; if old table exists without them, we'd need a rebuild.
-    # Most users will start fresh or can delete rideshare.db to recreate cleanly.
+    conn.commit()
+    conn.close()
+
+
+# ---------------- request/offer gating ----------------
+def has_active_rider_request(user_id: int) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM riders WHERE user_id=? AND status='searching' LIMIT 1", (user_id,))
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
+
+
+def has_active_driver_offer(user_id: int) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM drivers WHERE user_id=? AND status='available' LIMIT 1", (user_id,))
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
+
+
+def expire_old_requests() -> Dict[str, int]:
+    """
+    Expire searching riders and available drivers older than REQUEST_TIMEOUT_MINUTES.
+    (We mark status='expired' instead of deleting, so it’s auditable.)
+    """
+    conn = _connect()
+    cur = conn.cursor()
+
+    # Riders
+    cur.execute(
+        """
+        UPDATE riders
+        SET status='expired'
+        WHERE status='searching'
+          AND ((julianday('now') - julianday(created_at)) * 24 * 60) >= ?
+        """,
+        (REQUEST_TIMEOUT_MINUTES,),
+    )
+    expired_riders = cur.rowcount
+
+    # Drivers
+    cur.execute(
+        """
+        UPDATE drivers
+        SET status='expired'
+        WHERE status='available'
+          AND ((julianday('now') - julianday(created_at)) * 24 * 60) >= ?
+        """,
+        (REQUEST_TIMEOUT_MINUTES,),
+    )
+    expired_drivers = cur.rowcount
 
     conn.commit()
     conn.close()
+    return {"expired_riders": expired_riders, "expired_drivers": expired_drivers}
 
 
 # ---------------- users ----------------
@@ -345,7 +398,13 @@ def add_rider(
 ) -> int:
     conn = _connect()
     cur = conn.cursor()
-    cur.execute("DELETE FROM riders WHERE user_id=? AND status='searching'", (user_id,))
+
+    # ✅ ENFORCE: no new request while searching exists
+    cur.execute("SELECT 1 FROM riders WHERE user_id=? AND status='searching' LIMIT 1", (user_id,))
+    if cur.fetchone() is not None:
+        conn.close()
+        raise ValueError("Active rider request already exists")
+
     cur.execute(
         """
         INSERT INTO riders (user_id, username, first_name, pickup_lat, pickup_lon, dropoff_lat, dropoff_lon,
@@ -386,7 +445,13 @@ def add_driver(
 ) -> int:
     conn = _connect()
     cur = conn.cursor()
-    cur.execute("DELETE FROM drivers WHERE user_id=? AND status='available'", (user_id,))
+
+    # ✅ ENFORCE: no new offer while available exists
+    cur.execute("SELECT 1 FROM drivers WHERE user_id=? AND status='available' LIMIT 1", (user_id,))
+    if cur.fetchone() is not None:
+        conn.close()
+        raise ValueError("Active driver offer already exists")
+
     cur.execute(
         """
         INSERT INTO drivers (user_id, username, first_name, start_lat, start_lon, end_lat, end_lon, ride_time, available_seats)
@@ -506,7 +571,6 @@ def decrement_driver_seats(driver_id: int, used: int):
         "UPDATE drivers SET available_seats = MAX(available_seats - ?, 0) WHERE id=?",
         (used, driver_id),
     )
-    # If seats hit 0, mark not available
     cur.execute("SELECT available_seats FROM drivers WHERE id=?", (driver_id,))
     left = cur.fetchone()[0]
     if left <= 0:
@@ -548,7 +612,6 @@ def create_trip(driver_id: int, driver_user_id: int, total_seats: int, ride_time
         (driver_id, driver_user_id, total_seats, ride_time, start_lat, start_lon, end_lat, end_lon),
     )
     trip_id = cur.lastrowid
-    # link driver offer to trip
     cur.execute("UPDATE drivers SET trip_id=? WHERE id=?", (trip_id, driver_id))
     conn.commit()
     conn.close()
@@ -615,7 +678,6 @@ def complete_trip(trip_id: int) -> bool:
     cur = conn.cursor()
     cur.execute("UPDATE trips SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE id=? AND status='active'", (trip_id,))
     ok = cur.rowcount > 0
-    # mark matches for trip completed
     cur.execute("UPDATE matches SET status='completed', completed_at=CURRENT_TIMESTAMP WHERE trip_id=? AND status='matched'", (trip_id,))
     conn.commit()
     conn.close()
@@ -640,13 +702,9 @@ def create_match(rider_id: int, driver_id: int, rider_user_id: int, driver_user_
 
 # ---------------- reminders ----------------
 def get_riders_near_timeout(minutes_left: int = 5) -> List[Dict[str, Any]]:
-    """
-    Riders still searching whose request is close to timeout.
-    """
     conn = _connect()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    # created_at stored as string; julianday can handle it
     cur.execute(
         """
         SELECT *
@@ -710,9 +768,6 @@ def get_user_rating_summary(user_id: int) -> Optional[Dict[str, Any]]:
 
 # ---------------- history ----------------
 def get_user_trip_history(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Returns trips where user is driver or passenger.
-    """
     conn = _connect()
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -734,7 +789,7 @@ def get_user_trip_history(user_id: int, limit: int = 10) -> List[Dict[str, Any]]
     return [dict(r) for r in rows]
 
 
-# ---------------- reports (existing + small upgrades) ----------------
+# ---------------- reports ----------------
 def get_registration_stats() -> Dict[str, Any]:
     conn = _connect()
     cur = conn.cursor()
