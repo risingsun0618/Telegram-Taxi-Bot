@@ -278,10 +278,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    print(user, "-----------------------------")
     await update.message.reply_text(
         f"Your Telegram User ID: `{user.id}`\n\n"
         "Add this ID into ADMIN_IDS (env var) to grant admin access.",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 

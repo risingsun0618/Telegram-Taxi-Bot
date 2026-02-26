@@ -7,7 +7,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "7258222934:AAEO0yXO4D8D2WxO9n-s7ZFP-UbBQqUFX
 
 # Admin user IDs (Telegram numeric IDs)
 # Tip: run the bot and use /myid to get your id
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "@Milebrook,8292153740").split(",") if x.strip().isdigit()]
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "1022755242,8292153740").split(",") if x.strip().isdigit()]
+
 
 # Matching
 MATCH_RADIUS_KM = float(os.getenv("MATCH_RADIUS_KM", "5.0"))
