@@ -6,6 +6,9 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
+import httpx
+from urllib.parse import urlencode
+
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -71,6 +74,132 @@ TIME_SLOTS = [
 VEHICLE_TYPES = ["Car", "SUV", "Van", "Minibus"]
 DOCUMENT_TYPES = ["ID Card", "Driving License", "Passport"]
 
+# ---------------- typed address search (OpenStreetMap Nominatim) ----------------
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
+
+async def geocode_places(query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """
+    Geocode user-typed place names into (lat, lon) suggestions using OSM Nominatim.
+    Note: Nominatim has usage/rate limits. Avoid spamming requests.
+    """
+    q = (query or "").strip()
+    if len(q) < 3:
+        return []
+
+    params = {
+        "q": q,
+        "format": "jsonv2",
+        "limit": str(limit),
+        "addressdetails": "1",
+    }
+    headers = {
+        # Nominatim asks for a descriptive User-Agent; replace with your own contact.
+        "User-Agent": "RideShareTelegramBot/1.0 (contact: admin@example.com)",
+    }
+
+    url = f"{NOMINATIM_URL}?{urlencode(params)}"
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        resp = await client.get(url, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+
+    out: List[Dict[str, Any]] = []
+    for item in data:
+        try:
+            out.append(
+                {
+                    "display_name": item.get("display_name", ""),
+                    "lat": float(item["lat"]),
+                    "lon": float(item["lon"]),
+                }
+            )
+        except Exception:
+            continue
+    return out
+
+
+async def rider_dropoff_text_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Allow drop-off selection by typing an address/place.
+    """
+    text = (update.message.text or "").strip()
+
+    # User tapped a helper button
+    if text == "⌨️ Type Address":
+        await update.message.reply_text(
+            "Type your drop-off place (city + street/landmark).\n\n"
+            "Examples:\n"
+            "• Boryspil Airport\n"
+            "• Kyiv Khreshchatyk 1\n"
+            "• Lviv Railway Station",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return RIDER_DROPOFF
+
+    # Ignore the other buttons (they have their own handlers)
+    if text in ("📍 Choose On Map", "📍 Share Current Location"):
+        return RIDER_DROPOFF
+
+    results = await geocode_places(text, limit=5)
+    if not results:
+        await update.message.reply_text(
+            "I couldn't find that place. Try a more specific query (city + street / landmark).\n\n"
+            "Tip: you can also use “📍 Choose On Map”.",
+            reply_markup=get_location_keyboard(),
+        )
+        return RIDER_DROPOFF
+
+    context.user_data["dropoff_candidates"] = results
+
+    keyboard: List[List[InlineKeyboardButton]] = []
+    for i, r in enumerate(results):
+        title = r["display_name"] or "Unknown place"
+        if len(title) > 60:
+            title = title[:57] + "..."
+        keyboard.append([InlineKeyboardButton(title, callback_data=f"dropoff_pick_{i}")])
+
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+
+    await update.message.reply_text(
+        "Select the correct drop-off location:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return RIDER_DROPOFF
+
+
+async def rider_dropoff_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "cancel":
+        return await cancel_handler(update, context)
+
+    if not query.data.startswith("dropoff_pick_"):
+        return RIDER_DROPOFF
+
+    try:
+        idx = int(query.data.replace("dropoff_pick_", ""))
+    except ValueError:
+        await query.edit_message_text("Invalid selection. Please type the place again.")
+        return RIDER_DROPOFF
+
+    candidates = context.user_data.get("dropoff_candidates", [])
+    if idx < 0 or idx >= len(candidates):
+        await query.edit_message_text("That selection expired. Please type the place again.")
+        return RIDER_DROPOFF
+
+    chosen = candidates[idx]
+    context.user_data["dropoff_lat"] = chosen["lat"]
+    context.user_data["dropoff_lon"] = chosen["lon"]
+
+    await query.edit_message_text(
+        "✅ Drop-off location saved!\n\nStep 3/5: Select your *preferred ride time*:",
+        parse_mode="Markdown",
+        reply_markup=get_time_keyboard(),
+    )
+    return RIDER_TIME
+
 
 # ---------------- helpers ----------------
 def is_admin(user_id: int) -> bool:
@@ -96,6 +225,8 @@ def get_main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
         keyboard.append([InlineKeyboardButton("❌ Cancel Active", callback_data="cancel_active")])
         keyboard.append([InlineKeyboardButton("📜 Ride History", callback_data="history")])
         keyboard.append([InlineKeyboardButton("👤 My Profile", callback_data="my_profile")])
+
+        keyboard.append([InlineKeyboardButton("📣 Invite Friends", callback_data="invite")])
 
         if user["role"] == "driver":
             trip = db.get_active_trip_for_driver(user_id)
@@ -155,8 +286,10 @@ def get_vehicle_seats_keyboard() -> InlineKeyboardMarkup:
 
 
 def get_location_keyboard() -> ReplyKeyboardMarkup:
+    # Common UX: allow GPS, manual pin, OR typing an address/place name
     keyboard = [
-        [KeyboardButton("📍 Share Current Location", request_location=True), KeyboardButton("📍 Choose On Map")]
+        [KeyboardButton("📍 Share Current Location", request_location=True), KeyboardButton("📍 Choose On Map")],
+        [KeyboardButton("⌨️ Type Address")],
     ]
     return ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
@@ -269,11 +402,38 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
 # ---------------- core commands ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+
+    # Handle deep link payload: /start inv_<inviterId>
+    inviter_id = None
+    if context.args:
+        payload = (context.args[0] or "").strip()
+        if payload.startswith("inv_"):
+            try:
+                inviter_id = int(payload.replace("inv_", ""))
+            except ValueError:
+                inviter_id = None
+
     if update.message:
         await update.message.reply_text(
             f"Welcome to RideShare Bot, {user.first_name}! 🚗\n\nChoose an option below:",
             reply_markup=get_main_menu_keyboard(user.id),
         )
+    
+    if inviter_id and inviter_id != user.id:
+        # Optional: notify the inviter
+        try:
+            await context.bot.send_message(
+                chat_id=inviter_id,
+                text=f"✅ Someone opened your invite link: @{user.username or user.first_name} (ID: {user.id})",
+            )
+        except Exception:
+            pass
+
+        await update.message.reply_text(
+            "✅ Invite link detected.\n"
+            "You can register now (Passenger or Driver) using the menu below.\n /start"
+        )
+
     return MAIN_MENU
 
 
@@ -290,6 +450,34 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------- main menu callback handler ----------------
+
+def build_invite_link(bot_username: str, inviter_id: int) -> str:
+    # Deep-link payload: inv_<inviterId>
+    return f"https://t.me/{bot_username}?start=inv_{inviter_id}"
+
+
+async def invite_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    bot_username = (context.bot.username or "").lstrip("@")
+
+    if not bot_username:
+        await update.effective_message.reply_text(
+            "Bot username is not available. Please set a username for your bot in BotFather."
+        )
+        return MAIN_MENU
+
+    link = build_invite_link(bot_username, user.id)
+
+    await update.effective_message.reply_text(
+        "📣 Share this link to invite drivers or passengers:\n\n"
+        f"{link}\n\n"
+        "When they open it, the bot will know you invited them.",
+        disable_web_page_preview=True,
+        reply_markup=get_main_menu_keyboard(user.id),
+    )
+    return MAIN_MENU
+
+
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query:
@@ -398,6 +586,13 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         driver_cancelled = db.cancel_driver_offer(user.id)
         msg = "✅ Your active request/offer has been cancelled." if (rider_cancelled or driver_cancelled) else "ℹ️ No active request/offer found."
         await query.edit_message_text(msg + "\n\nChoose an option:", reply_markup=get_main_menu_keyboard(user.id))
+        return MAIN_MENU
+
+    if query.data == "invite":
+        if query.message:
+            await invite_handler(update, context)
+        else:
+            await invite_handler(update, context)
         return MAIN_MENU
 
     if query.data == "admin_panel":
@@ -1458,7 +1653,7 @@ def build_application() -> Application:
             CommandHandler("start", start),
             CallbackQueryHandler(
                 main_menu_handler,
-                pattern=r"^(register|status_pending|request_ride|offer_ride|cancel_active|history|my_profile|admin_panel|back_main)$",
+                pattern=r"^(register|status_pending|request_ride|offer_ride|cancel_active|history|my_profile|admin_panel|back_main|invite)$",
             ),
         ],
         states={
@@ -1482,7 +1677,9 @@ def build_application() -> Application:
             ],
             RIDER_DROPOFF: [
                 MessageHandler(filters.LOCATION, rider_dropoff_location),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, rider_dropoff_text_search),
                 MessageHandler(filters.Regex(r"^📍 Choose On Map$"), rider_dropoff_choose_on_map),
+                CallbackQueryHandler(rider_dropoff_pick, pattern=r"^dropoff_pick_\d+$"),
                 CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
             ],
             RIDER_TIME: [CallbackQueryHandler(rider_time_selection)],
@@ -1523,6 +1720,7 @@ def build_application() -> Application:
 
     # standalone command
     application.add_handler(CommandHandler("myid", myid))
+    application.add_handler(CommandHandler("invite", invite_handler))
 
     # job queue
     if application.job_queue:
