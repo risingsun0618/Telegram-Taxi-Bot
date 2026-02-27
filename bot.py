@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 from telegram import (
     Update,
@@ -34,9 +34,10 @@ from config import (
     ENABLE_SURGE_PRICING,
     PRIORITY_FEE,
 )
+
 import database as db
 import matching
-import analytics as an
+import analytics as an  # optional (kept from your project)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -71,6 +72,7 @@ VEHICLE_TYPES = ["Car", "SUV", "Van", "Minibus"]
 DOCUMENT_TYPES = ["ID Card", "Driving License", "Passport"]
 
 
+# ---------------- helpers ----------------
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -160,34 +162,38 @@ def get_location_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def rider_pickup_choose_on_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "To choose a pickup point: attachment → Location → drop pin → Send Location.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if update.message:
+        await update.message.reply_text(
+            "To choose a pickup point: attachment → Location → drop pin → Send Location.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     return RIDER_PICKUP
 
 
 async def rider_dropoff_choose_on_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "To choose a drop-off point: attachment → Location → drop pin → Send Location.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if update.message:
+        await update.message.reply_text(
+            "To choose a drop-off point: attachment → Location → drop pin → Send Location.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     return RIDER_DROPOFF
 
 
 async def driver_start_choose_on_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "To choose your start point: attachment → Location → drop pin → Send Location.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if update.message:
+        await update.message.reply_text(
+            "To choose your start point: attachment → Location → drop pin → Send Location.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     return DRIVER_START
 
 
 async def driver_end_choose_on_map(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "To choose your destination: attachment → Location → drop pin → Send Location.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if update.message:
+        await update.message.reply_text(
+            "To choose your destination: attachment → Location → drop pin → Send Location.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     return DRIVER_END
 
 
@@ -254,40 +260,40 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🚗 Trip Report", callback_data="admin_report_trips")],
         [InlineKeyboardButton("⏱️ Waiting Time Report", callback_data="admin_report_wait")],
         [InlineKeyboardButton("💺 Seat Utilization Report", callback_data="admin_report_seats")],
-        [InlineKeyboardButton("📈 Advanced Analytics", callback_data="admin_analytics")],
         [InlineKeyboardButton("👥 All Users", callback_data="admin_users")],
         [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-def rating_stars_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [[InlineKeyboardButton("⭐" * i, callback_data=f"rate_{i}")] for i in range(1, 6)]
-    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
-    return InlineKeyboardMarkup(keyboard)
-
-
+# ---------------- core commands ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    await update.message.reply_text(
-        f"Welcome to RideShare Bot, {user.first_name}! 🚗\n\nChoose an option below:",
-        reply_markup=get_main_menu_keyboard(user.id),
-    )
+    if update.message:
+        await update.message.reply_text(
+            f"Welcome to RideShare Bot, {user.first_name}! 🚗\n\nChoose an option below:",
+            reply_markup=get_main_menu_keyboard(user.id),
+        )
     return MAIN_MENU
 
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Return numeric Telegram user id (safe: no markdown parsing problems)."""
     user = update.effective_user
     print(user, "-----------------------------")
-    await update.message.reply_text(
-        f"Your Telegram User ID: `{user.id}`\n\n"
-        "Add this ID into ADMIN_IDS (env var) to grant admin access.",
-        parse_mode="HTML",
-    )
+    if update.message:
+        await update.message.reply_text(
+            f"Your Telegram User ID: {user.id}\n\n"
+            "Add this numeric ID into ADMIN_IDS to grant admin access.",
+            parse_mode=None,
+        )
 
 
+# ---------------- main menu callback handler ----------------
 async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return MAIN_MENU
     await query.answer()
     user = update.effective_user
 
@@ -344,7 +350,6 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return MAIN_MENU
 
-        # ✅ BLOCK new requests while existing searching request exists
         if db.has_active_rider_request(user.id):
             await query.edit_message_text(
                 "⏳ You already have an active ride request.\n\n"
@@ -371,7 +376,6 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return MAIN_MENU
 
-        # ✅ BLOCK new offers while existing available offer exists
         if db.has_active_driver_offer(user.id):
             await query.edit_message_text(
                 "⏳ You already have an active ride offer.\n\n"
@@ -415,13 +419,271 @@ async def main_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return MAIN_MENU
 
 
-# ---------------- registration (same as your original) ----------------
+# ---------------- admin panel ----------------
+def _user_summary_line(u: Dict[str, Any]) -> str:
+    return f"{u.get('name','')} — {u.get('role','')} — @{u.get('username','') or 'no_username'} — {u.get('status','')}"
+
+
+async def admin_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ADMIN_MENU
+    await query.answer()
+    admin = update.effective_user
+
+    if not is_admin(admin.id):
+        await query.edit_message_text("❌ Access denied.", reply_markup=get_main_menu_keyboard(admin.id))
+        return MAIN_MENU
+
+    data = query.data or ""
+
+    if data in ("back_main",):
+        await query.edit_message_text("Choose an option:", reply_markup=get_main_menu_keyboard(admin.id))
+        return MAIN_MENU
+
+    if data in ("admin_panel",):
+        await query.edit_message_text(
+            "🔧 *Admin Panel*\n\nSelect an option:",
+            parse_mode="Markdown",
+            reply_markup=get_admin_keyboard(),
+        )
+        return ADMIN_MENU
+
+    if data == "admin_pending":
+        pending = db.get_pending_registrations()
+        if not pending:
+            await query.edit_message_text(
+                "✅ No pending registrations.",
+                reply_markup=get_admin_keyboard(),
+            )
+            return ADMIN_MENU
+
+        kb: List[List[InlineKeyboardButton]] = []
+        for u in pending[:30]:
+            label = f"{u['name']} ({u['role']})"
+            kb.append([InlineKeyboardButton(label, callback_data=f"admin_view_{u['user_id']}")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+
+        await query.edit_message_text(
+            "📋 *Pending Registrations*\n\nSelect a user to review:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return ADMIN_MENU
+
+    if data == "admin_users":
+        users = db.get_all_users()
+        if not users:
+            await query.edit_message_text("No users found.", reply_markup=get_admin_keyboard())
+            return ADMIN_MENU
+
+        kb: List[List[InlineKeyboardButton]] = []
+        for u in users[:30]:
+            label = f"{u['name']} ({u['role']}, {u['status']})"
+            kb.append([InlineKeyboardButton(label, callback_data=f"admin_view_{u['user_id']}")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_panel")])
+
+        await query.edit_message_text(
+            "👥 *All Users* (top 30 recent)\n\nSelect a user to view:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return ADMIN_MENU
+
+    if data == "admin_report_reg":
+        stats = db.get_registration_stats()
+        text = (
+            "📊 *Registration Report*\n\n"
+            f"Pending: {stats['pending']}\n"
+            f"Approved: {stats['approved']}\n"
+            f"Rejected: {stats['rejected']}\n\n"
+            f"Approved Drivers: {stats['total_drivers']}\n"
+            f"Approved Passengers: {stats['total_passengers']}\n"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        return ADMIN_MENU
+
+    if data == "admin_report_trips":
+        stats = db.get_trip_stats()
+        text = (
+            "🚗 *Trip Report*\n\n"
+            f"Total matches: {stats['total_matches']}\n"
+            f"Total trips: {stats['total_trips']}\n"
+            f"Active trips: {stats['active_trips']}\n"
+            f"Completed trips: {stats['completed_trips']}\n\n"
+            f"Riders waiting: {stats['riders_waiting']}\n"
+            f"Drivers available: {stats['drivers_available']}\n"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        return ADMIN_MENU
+
+    if data == "admin_report_wait":
+        stats = db.get_waiting_time_stats()
+        text = (
+            "⏱️ *Waiting Time Report*\n\n"
+            f"Average wait (matched riders): {stats['avg_wait_minutes']} min\n"
+            f"Currently waiting: {stats['currently_waiting']}\n"
+            f"Current avg wait: {stats['current_avg_wait_minutes']} min\n"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        return ADMIN_MENU
+
+    if data == "admin_report_seats":
+        stats = db.get_seat_utilization()
+        text = (
+            "💺 *Seat Utilization*\n\n"
+            f"Total seats offered: {stats['total_seats_offered']}\n"
+            f"Total seats filled: {stats['total_seats_filled']}\n"
+            f"Utilization rate: {stats['utilization_rate']}%\n"
+        )
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        return ADMIN_MENU
+
+    # View user action
+    if data.startswith("admin_view_"):
+        target_user_id = int(data.replace("admin_view_", ""))
+        u = db.get_user(target_user_id)
+        if not u:
+            await query.edit_message_text("User not found.", reply_markup=get_admin_keyboard())
+            return ADMIN_MENU
+
+        status = u.get("status", "")
+        role = u.get("role", "")
+        doc_path = u.get("document_path") or ""
+        doc_exists = bool(doc_path and os.path.exists(doc_path))
+
+        text = (
+            "👤 *User Details*\n\n"
+            f"*Name:* {u.get('name','')}\n"
+            f"*Role:* {role}\n"
+            f"*Status:* {status}\n"
+            f"*Phone:* {u.get('phone','')}\n"
+            f"*Username:* @{u.get('username','') or 'no_username'}\n"
+            f"*Telegram ID:* `{u.get('user_id')}`\n"
+        )
+        if role == "driver":
+            text += (
+                f"\n*Vehicle:* {u.get('vehicle_type')}\n"
+                f"*Seats:* {u.get('vehicle_seats')}\n"
+                f"*Year/Model:* {u.get('vehicle_year_model')}\n"
+            )
+
+        kb: List[List[InlineKeyboardButton]] = []
+
+        if status == "pending":
+            kb.append([InlineKeyboardButton("✅ Approve", callback_data=f"admin_approve_{target_user_id}")])
+            kb.append([InlineKeyboardButton("❌ Reject", callback_data=f"admin_reject_{target_user_id}")])
+
+        if doc_exists:
+            kb.append([InlineKeyboardButton("📎 Send Document Photo", callback_data=f"admin_doc_{target_user_id}")])
+
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="admin_pending")])
+        kb.append([InlineKeyboardButton("🏠 Admin Home", callback_data="admin_panel")])
+
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+        return ADMIN_VIEW_USER
+
+    return ADMIN_MENU
+
+
+async def admin_view_user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle approve/reject/doc actions."""
+    query = update.callback_query
+    if not query:
+        return ADMIN_VIEW_USER
+    await query.answer()
+    admin = update.effective_user
+
+    if not is_admin(admin.id):
+        await query.edit_message_text("❌ Access denied.", reply_markup=get_main_menu_keyboard(admin.id))
+        return MAIN_MENU
+
+    data = query.data or ""
+
+    if data in ("admin_pending", "admin_panel", "back_main", "admin_users",
+                "admin_report_reg", "admin_report_trips", "admin_report_wait", "admin_report_seats"):
+        # Route back into admin_menu_handler for consistency
+        return await admin_menu_handler(update, context)
+
+    if data.startswith("admin_doc_"):
+        target_user_id = int(data.replace("admin_doc_", ""))
+        u = db.get_user(target_user_id)
+        if not u or not u.get("document_path"):
+            await query.edit_message_text("Document not found for this user.", reply_markup=get_admin_keyboard())
+            return ADMIN_MENU
+
+        path = u["document_path"]
+        if not os.path.exists(path):
+            await query.edit_message_text("Document file is missing on server.", reply_markup=get_admin_keyboard())
+            return ADMIN_MENU
+
+        # send as photo (best for jpg)
+        try:
+            await context.bot.send_photo(chat_id=admin.id, photo=open(path, "rb"), caption=f"Document for {u.get('name','')}")
+        except Exception as e:
+            logger.error("Failed to send document: %s", e)
+            await query.edit_message_text("Failed to send document.", reply_markup=get_admin_keyboard())
+            return ADMIN_MENU
+
+        await query.edit_message_text("📎 Document sent to you in chat.\n\nSelect next action:", reply_markup=get_admin_keyboard())
+        return ADMIN_MENU
+
+    if data.startswith("admin_approve_"):
+        target_user_id = int(data.replace("admin_approve_", ""))
+        ok = db.approve_user(target_user_id, admin.id)
+        if ok:
+            # notify user
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text="✅ Your registration has been approved! You can now use the bot.",
+                    reply_markup=get_main_menu_keyboard(target_user_id),
+                )
+            except Exception as e:
+                logger.error("Failed to notify approved user %s: %s", target_user_id, e)
+
+            await query.edit_message_text("✅ User approved.", reply_markup=get_admin_keyboard())
+        else:
+            await query.edit_message_text("ℹ️ User is not pending (maybe already processed).", reply_markup=get_admin_keyboard())
+        return ADMIN_MENU
+
+    if data.startswith("admin_reject_"):
+        target_user_id = int(data.replace("admin_reject_", ""))
+        ok = db.reject_user(target_user_id, admin.id)
+        if ok:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_user_id,
+                    text="❌ Your registration was rejected. You may /start and register again with correct details.",
+                    reply_markup=get_main_menu_keyboard(target_user_id),
+                )
+            except Exception as e:
+                logger.error("Failed to notify rejected user %s: %s", target_user_id, e)
+
+            await query.edit_message_text("❌ User rejected.", reply_markup=get_admin_keyboard())
+        else:
+            await query.edit_message_text("ℹ️ User is not pending (maybe already processed).", reply_markup=get_admin_keyboard())
+        return ADMIN_MENU
+
+    return ADMIN_MENU
+
+
+# ---------------- registration ----------------
 async def reg_role_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return REG_ROLE
     await query.answer()
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Registration cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await query.edit_message_text(
+            "❌ Registration cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(update.effective_user.id),
+        )
         return MAIN_MENU
 
     if query.data == "reg_passenger":
@@ -436,6 +698,8 @@ async def reg_role_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def reg_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return REG_NAME
     context.user_data["reg_name"] = update.message.text.strip()
     await update.message.reply_text(
         "📱 Please enter your *phone number*:\n\n(Include country code, e.g., +1234567890)",
@@ -445,6 +709,8 @@ async def reg_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def reg_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return REG_PHONE
     context.user_data["reg_phone"] = update.message.text.strip()
     await update.message.reply_text(
         "📄 Please select your *document type* for verification:",
@@ -456,10 +722,15 @@ async def reg_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def reg_document_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return REG_DOCUMENT_TYPE
     await query.answer()
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Registration cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await query.edit_message_text(
+            "❌ Registration cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(update.effective_user.id),
+        )
         return MAIN_MENU
 
     if query.data.startswith("doctype_"):
@@ -475,6 +746,8 @@ async def reg_document_type_handler(update: Update, context: ContextTypes.DEFAUL
 
 async def reg_document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    if not update.message:
+        return REG_DOCUMENT
 
     if not update.message.photo:
         await update.message.reply_text("Please send a *photo* of your document.", parse_mode="Markdown")
@@ -501,10 +774,15 @@ async def reg_document_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def reg_vehicle_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return REG_VEHICLE_TYPE
     await query.answer()
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Registration cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await query.edit_message_text(
+            "❌ Registration cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(update.effective_user.id),
+        )
         return MAIN_MENU
 
     if query.data.startswith("vtype_"):
@@ -521,10 +799,15 @@ async def reg_vehicle_type_handler(update: Update, context: ContextTypes.DEFAULT
 
 async def reg_vehicle_seats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return REG_VEHICLE_SEATS
     await query.answer()
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Registration cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await query.edit_message_text(
+            "❌ Registration cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(update.effective_user.id),
+        )
         return MAIN_MENU
 
     if query.data.startswith("vseats_"):
@@ -539,6 +822,8 @@ async def reg_vehicle_seats_handler(update: Update, context: ContextTypes.DEFAUL
 
 
 async def reg_vehicle_year_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return REG_VEHICLE_YEAR
     context.user_data["reg_vehicle_year"] = update.message.text.strip()
     return await complete_registration(update, context)
 
@@ -559,6 +844,7 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
         vehicle_year_model=context.user_data.get("reg_vehicle_year"),
     )
 
+    # Notify admins
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(
@@ -568,7 +854,7 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
                     f"Name: {context.user_data['reg_name']}\n"
                     f"Role: {context.user_data['reg_role'].title()}\n"
                     f"Phone: {context.user_data['reg_phone']}\n\n"
-                    "Use Admin Panel to review."
+                    "Use Admin Panel → Pending Registrations to review."
                 ),
                 parse_mode="Markdown",
             )
@@ -582,7 +868,7 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
     )
     if update.callback_query:
         await update.callback_query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(user.id))
-    else:
+    elif update.message:
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(user.id))
 
     context.user_data.clear()
@@ -591,8 +877,12 @@ async def complete_registration(update: Update, context: ContextTypes.DEFAULT_TY
 
 # ---------------- rider flow ----------------
 async def rider_pickup_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.location:
-        await update.message.reply_text("Please share your location using the button below.", reply_markup=get_location_keyboard())
+    if not update.message or not update.message.location:
+        if update.message:
+            await update.message.reply_text(
+                "Please share your location using the button below.",
+                reply_markup=get_location_keyboard(),
+            )
         return RIDER_PICKUP
 
     context.user_data["pickup_lat"] = update.message.location.latitude
@@ -607,8 +897,12 @@ async def rider_pickup_location(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def rider_dropoff_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.location:
-        await update.message.reply_text("Please share your location using the button below.", reply_markup=get_location_keyboard())
+    if not update.message or not update.message.location:
+        if update.message:
+            await update.message.reply_text(
+                "Please share your location using the button below.",
+                reply_markup=get_location_keyboard(),
+            )
         return RIDER_DROPOFF
 
     context.user_data["dropoff_lat"] = update.message.location.latitude
@@ -624,10 +918,15 @@ async def rider_dropoff_location(update: Update, context: ContextTypes.DEFAULT_T
 
 async def rider_time_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return RIDER_TIME
     await query.answer()
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Request cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await query.edit_message_text(
+            "❌ Request cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(update.effective_user.id),
+        )
         return MAIN_MENU
 
     if query.data.startswith("time_"):
@@ -644,11 +943,16 @@ async def rider_time_selection(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def rider_passengers_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return RIDER_PASSENGERS
     await query.answer()
     user = update.effective_user
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Request cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(user.id))
+        await query.edit_message_text(
+            "❌ Request cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(user.id),
+        )
         return MAIN_MENU
 
     if not query.data.startswith("passengers_"):
@@ -667,11 +971,16 @@ async def rider_passengers_selection(update: Update, context: ContextTypes.DEFAU
 
 async def rider_priority_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return RIDER_PRIORITY
     await query.answer()
     user = update.effective_user
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Request cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(user.id))
+        await query.edit_message_text(
+            "❌ Request cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(user.id),
+        )
         return MAIN_MENU
 
     is_priority = (query.data == "priority_yes") if ENABLE_PRIORITY_MATCHING else False
@@ -708,11 +1017,16 @@ async def rider_priority_selection(update: Update, context: ContextTypes.DEFAULT
 
 async def rider_confirm_fare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return RIDER_CONFIRM_FARE
     await query.answer()
     user = update.effective_user
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Request cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(user.id))
+        await query.edit_message_text(
+            "❌ Request cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(user.id),
+        )
         return MAIN_MENU
 
     if query.data != "confirm_ride":
@@ -769,8 +1083,12 @@ async def rider_confirm_fare(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ---------------- driver flow ----------------
 async def driver_start_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.location:
-        await update.message.reply_text("Please share your location using the button below.", reply_markup=get_location_keyboard())
+    if not update.message or not update.message.location:
+        if update.message:
+            await update.message.reply_text(
+                "Please share your location using the button below.",
+                reply_markup=get_location_keyboard(),
+            )
         return DRIVER_START
 
     context.user_data["start_lat"] = update.message.location.latitude
@@ -784,8 +1102,12 @@ async def driver_start_location(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def driver_end_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message.location:
-        await update.message.reply_text("Please share your location using the button below.", reply_markup=get_location_keyboard())
+    if not update.message or not update.message.location:
+        if update.message:
+            await update.message.reply_text(
+                "Please share your location using the button below.",
+                reply_markup=get_location_keyboard(),
+            )
         return DRIVER_END
 
     context.user_data["end_lat"] = update.message.location.latitude
@@ -800,10 +1122,15 @@ async def driver_end_location(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def driver_time_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return DRIVER_TIME
     await query.answer()
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Offer cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(update.effective_user.id))
+        await query.edit_message_text(
+            "❌ Offer cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(update.effective_user.id),
+        )
         return MAIN_MENU
 
     if query.data.startswith("time_"):
@@ -820,11 +1147,16 @@ async def driver_time_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def driver_seats_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return DRIVER_SEATS
     await query.answer()
     user = update.effective_user
 
     if query.data == "cancel":
-        await query.edit_message_text("❌ Offer cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(user.id))
+        await query.edit_message_text(
+            "❌ Offer cancelled.\n\nChoose an option:",
+            reply_markup=get_main_menu_keyboard(user.id),
+        )
         return MAIN_MENU
 
     if not query.data.startswith("seats_"):
@@ -874,7 +1206,7 @@ async def driver_seats_selection(update: Update, context: ContextTypes.DEFAULT_T
     return MAIN_MENU
 
 
-# ---------------- matching notifications (same logic as original, trimmed) ----------------
+# ---------------- matching notifications ----------------
 async def notify_match(context: ContextTypes.DEFAULT_TYPE, match_details: Dict[str, Any]):
     rider_user_id = match_details["rider_user_id"]
     driver_user_id = match_details["driver_user_id"]
@@ -928,12 +1260,22 @@ async def notify_match(context: ContextTypes.DEFAULT_TYPE, match_details: Dict[s
     )
 
     try:
-        await context.bot.send_message(chat_id=rider_user_id, text=rider_message, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(rider_user_id))
+        await context.bot.send_message(
+            chat_id=rider_user_id,
+            text=rider_message,
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard(rider_user_id),
+        )
     except Exception as e:
         logger.error("Failed to notify rider %s: %s", rider_user_id, e)
 
     try:
-        await context.bot.send_message(chat_id=driver_user_id, text=driver_message, parse_mode="Markdown", reply_markup=get_main_menu_keyboard(driver_user_id))
+        await context.bot.send_message(
+            chat_id=driver_user_id,
+            text=driver_message,
+            parse_mode="Markdown",
+            reply_markup=get_main_menu_keyboard(driver_user_id),
+        )
     except Exception as e:
         logger.error("Failed to notify driver %s: %s", driver_user_id, e)
 
@@ -961,9 +1303,11 @@ async def notify_match(context: ContextTypes.DEFAULT_TYPE, match_details: Dict[s
         logger.error("Failed to schedule reminders: %s", e)
 
 
-# ---------------- history (minimal) ----------------
+# ---------------- history ----------------
 async def history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return HISTORY_MENU
     await query.answer()
     user = update.effective_user
 
@@ -972,12 +1316,18 @@ async def history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         [InlineKeyboardButton("⭐ My Ratings", callback_data="history_ratings")],
         [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
     ]
-    await query.edit_message_text("📜 *Ride History*\n\nChoose:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(
+        "📜 *Ride History*\n\nChoose:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
     return HISTORY_MENU
 
 
 async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return HISTORY_MENU
     await query.answer()
     user = update.effective_user
 
@@ -988,19 +1338,31 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "history_trips":
         items = db.get_user_trip_history(user.id, limit=10)
         if not items:
-            await query.edit_message_text("📜 *Ride History*\n\nNo trips yet.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="history")]]))
+            await query.edit_message_text(
+                "📜 *Ride History*\n\nNo trips yet.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="history")]]),
+            )
             return HISTORY_MENU
 
         lines = ["📜 *Recent Trips* (last 10)\n"]
         for t in items:
             lines.append(f"• Trip #{t['id']} — {t['ride_time']} — {t['status']} — seats {t['seats_filled']}/{t['total_seats']}")
-        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="history")]]))
+        await query.edit_message_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="history")]]),
+        )
         return HISTORY_MENU
 
     if query.data == "history_ratings":
         summary = db.get_user_rating_summary(user.id)
         if not summary:
-            await query.edit_message_text("⭐ *My Ratings*\n\nNo ratings yet.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="history")]]))
+            await query.edit_message_text(
+                "⭐ *My Ratings*\n\nNo ratings yet.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="history")]]),
+            )
             return HISTORY_MENU
 
         await query.edit_message_text(
@@ -1021,10 +1383,8 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # ---------------- background jobs ----------------
 async def periodic_jobs(context: ContextTypes.DEFAULT_TYPE):
     try:
-        # ✅ expire old stuff first (this enables “paused until expires” rule)
         db.expire_old_requests()
 
-        # Auto-match
         riders = db.get_searching_riders_sorted()
         drivers = db.get_available_drivers()
         for rider in riders:
@@ -1034,7 +1394,6 @@ async def periodic_jobs(context: ContextTypes.DEFAULT_TYPE):
                 await notify_match(context, details)
                 drivers = db.get_available_drivers()
 
-        # Remind riders near timeout
         soon = db.get_riders_near_timeout(minutes_left=5)
         for r in soon:
             if r.get("reminder_sent"):
@@ -1071,6 +1430,8 @@ async def departure_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not query:
+        return MAIN_MENU
     await query.answer()
     user = update.effective_user
     await query.edit_message_text("❌ Cancelled.\n\nChoose an option:", reply_markup=get_main_menu_keyboard(user.id))
@@ -1080,10 +1441,11 @@ async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    await update.message.reply_text(
-        "I didn't understand that. Please use the buttons.\n\nType /start to see the menu.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    if update.message:
+        await update.message.reply_text(
+            "I didn't understand that. Please use the buttons.\n\nType /start to see the menu.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     return MAIN_MENU
 
 
@@ -1101,6 +1463,8 @@ def build_application() -> Application:
         ],
         states={
             MAIN_MENU: [CallbackQueryHandler(main_menu_handler)],
+
+            # Registration
             REG_ROLE: [CallbackQueryHandler(reg_role_handler)],
             REG_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name_handler)],
             REG_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_phone_handler)],
@@ -1110,14 +1474,15 @@ def build_application() -> Application:
             REG_VEHICLE_SEATS: [CallbackQueryHandler(reg_vehicle_seats_handler)],
             REG_VEHICLE_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_vehicle_year_handler)],
 
+            # Rider flow
             RIDER_PICKUP: [
                 MessageHandler(filters.LOCATION, rider_pickup_location),
-                MessageHandler(filters.Regex(r'^📍 Choose On Map$'), rider_pickup_choose_on_map),
+                MessageHandler(filters.Regex(r"^📍 Choose On Map$"), rider_pickup_choose_on_map),
                 CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
             ],
             RIDER_DROPOFF: [
                 MessageHandler(filters.LOCATION, rider_dropoff_location),
-                MessageHandler(filters.Regex(r'^📍 Choose On Map$'), rider_dropoff_choose_on_map),
+                MessageHandler(filters.Regex(r"^📍 Choose On Map$"), rider_dropoff_choose_on_map),
                 CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
             ],
             RIDER_TIME: [CallbackQueryHandler(rider_time_selection)],
@@ -1125,20 +1490,26 @@ def build_application() -> Application:
             RIDER_PRIORITY: [CallbackQueryHandler(rider_priority_selection)],
             RIDER_CONFIRM_FARE: [CallbackQueryHandler(rider_confirm_fare)],
 
+            # Driver flow
             DRIVER_START: [
                 MessageHandler(filters.LOCATION, driver_start_location),
-                MessageHandler(filters.Regex(r'^📍 Choose On Map$'), driver_start_choose_on_map),
+                MessageHandler(filters.Regex(r"^📍 Choose On Map$"), driver_start_choose_on_map),
                 CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
             ],
             DRIVER_END: [
                 MessageHandler(filters.LOCATION, driver_end_location),
-                MessageHandler(filters.Regex(r'^📍 Choose On Map$'), driver_end_choose_on_map),
+                MessageHandler(filters.Regex(r"^📍 Choose On Map$"), driver_end_choose_on_map),
                 CallbackQueryHandler(cancel_handler, pattern="^cancel$"),
             ],
             DRIVER_TIME: [CallbackQueryHandler(driver_time_selection)],
             DRIVER_SEATS: [CallbackQueryHandler(driver_seats_selection)],
 
+            # History
             HISTORY_MENU: [CallbackQueryHandler(history_handler)],
+
+            # Admin
+            ADMIN_MENU: [CallbackQueryHandler(admin_menu_handler)],
+            ADMIN_VIEW_USER: [CallbackQueryHandler(admin_view_user_handler)],
         },
         fallbacks=[
             CommandHandler("start", start),
@@ -1149,9 +1520,11 @@ def build_application() -> Application:
     )
 
     application.add_handler(conv_handler)
+
+    # standalone command
     application.add_handler(CommandHandler("myid", myid))
 
-    # ✅ IMPORTANT: job_queue requires python-telegram-bot[job-queue]
+    # job queue
     if application.job_queue:
         application.job_queue.run_repeating(periodic_jobs, interval=REMINDER_CHECK_INTERVAL_SECONDS, first=10)
     else:

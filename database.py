@@ -6,9 +6,15 @@ from config import DATABASE_PATH, REQUEST_TIMEOUT_MINUTES
 
 
 # ---------------- helpers ----------------
-def _connect():
+def _connect(row_factory: bool = False) -> sqlite3.Connection:
+    """
+    Creates a SQLite connection with FK enabled.
+    If row_factory=True, rows can be accessed like dict (sqlite3.Row).
+    """
     conn = sqlite3.connect(DATABASE_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
+    if row_factory:
+        conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -175,6 +181,13 @@ def init_db():
 
     _add_column_if_missing(conn, "drivers", "trip_id INTEGER", "trip_id")
 
+    # Helpful indexes (safe to run multiple times with IF NOT EXISTS)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_users_status_created ON users(status, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_riders_status_created ON riders(status, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_drivers_status_created ON drivers(status, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trips_status_created ON trips(status, created_at)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_trip_passengers_trip ON trip_passengers(trip_id)")
+
     conn.commit()
     conn.close()
 
@@ -307,8 +320,7 @@ def register_user(
 
 
 def get_user(user_id: int) -> Optional[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
     cur.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
@@ -330,10 +342,9 @@ def is_user_approved(user_id: int) -> bool:
 
 
 def get_pending_registrations() -> List[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE status='pending' ORDER BY created_at")
+    cur.execute("SELECT * FROM users WHERE status='pending' ORDER BY created_at ASC")
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -372,8 +383,7 @@ def reject_user(user_id: int, admin_id: int) -> bool:
 
 
 def get_all_users() -> List[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
     cur.execute("SELECT * FROM users ORDER BY created_at DESC")
     rows = cur.fetchall()
@@ -619,18 +629,19 @@ def create_trip(driver_id: int, driver_user_id: int, total_seats: int, ride_time
 
 
 def get_active_trip_for_driver(driver_user_id: int) -> Optional[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
-    cur.execute("SELECT * FROM trips WHERE driver_user_id=? AND status='active' ORDER BY created_at DESC LIMIT 1", (driver_user_id,))
+    cur.execute(
+        "SELECT * FROM trips WHERE driver_user_id=? AND status='active' ORDER BY created_at DESC LIMIT 1",
+        (driver_user_id,),
+    )
     row = cur.fetchone()
     conn.close()
     return dict(row) if row else None
 
 
 def get_trip_by_id(trip_id: int) -> Optional[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
     cur.execute("SELECT * FROM trips WHERE id=?", (trip_id,))
     row = cur.fetchone()
@@ -654,8 +665,7 @@ def add_passenger_to_trip(trip_id: int, rider_user_id: int, rider_id: int, passe
 
 
 def get_trip_passengers(trip_id: int) -> List[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
     cur.execute(
         """
@@ -702,8 +712,7 @@ def create_match(rider_id: int, driver_id: int, rider_user_id: int, driver_user_
 
 # ---------------- reminders ----------------
 def get_riders_near_timeout(minutes_left: int = 5) -> List[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
     cur.execute(
         """
@@ -768,8 +777,7 @@ def get_user_rating_summary(user_id: int) -> Optional[Dict[str, Any]]:
 
 # ---------------- history ----------------
 def get_user_trip_history(user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-    conn = _connect()
-    conn.row_factory = sqlite3.Row
+    conn = _connect(row_factory=True)
     cur = conn.cursor()
 
     cur.execute(
